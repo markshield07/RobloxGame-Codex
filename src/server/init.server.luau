@@ -1,56 +1,77 @@
 --[[
     init.server.luau
-    Server bootstrap script. Initializes all server modules in dependency order.
-    This is the entry point for the server (placed in ServerScriptService).
+    Server bootstrap script. Initializes all server-side systems in dependency order.
+
+    Boot sequence:
+      1. NetworkManager (creates remotes first so other systems can register handlers)
+      2. PlayerDataManager (data layer must be ready before gameplay systems)
+      3. EconomyManager, InventoryManager (depend on data layer)
+      4. ProgressionManager (depends on data + economy)
+      5. SquadManager (depends on network)
+      6. DisasterManager (standalone)
+      7. RescueManager (depends on network + disaster)
+      8. GameManager (orchestrator, depends on everything)
+      9. Wire up client->server event handlers
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 ----------------------------------------------------------------------
--- Load all services
+-- REQUIRE ALL MODULES
 ----------------------------------------------------------------------
-local Services = script.Services
-local DataManager = require(Services.DataManager)
-local NetworkManager = require(Services.NetworkManager)
-local SquadManager = require(Services.SquadManager)
-local DisasterManager = require(Services.DisasterManager)
-local RescueManager = require(Services.RescueManager)
-local EconomyManager = require(Services.EconomyManager)
-local ProgressionManager = require(Services.ProgressionManager)
-local GameManager = require(Services.GameManager)
+local NetworkManager = require(script.Services.NetworkManager)
+local PlayerDataManager = require(script.Data.PlayerDataManager)
+local EconomyManager = require(script.Services.EconomyManager)
+local InventoryManager = require(script.Services.InventoryManager)
+local ProgressionManager = require(script.Services.ProgressionManager)
+local SquadManager = require(script.Services.SquadManager)
+local DisasterManager = require(script.Services.DisasterManager)
+local RescueManager = require(script.Services.RescueManager)
+local GameManager = require(script.Services.GameManager)
 
 ----------------------------------------------------------------------
--- Initialize in dependency order
+-- INITIALIZE IN DEPENDENCY ORDER
 ----------------------------------------------------------------------
-print("=== Rescue Squad Simulator Server Starting ===")
+print("=== Rescue Squad Simulator: Server Boot ===")
 
--- Layer 0: No dependencies
-DataManager:Init()
+-- Layer 0: Networking
 NetworkManager:Init()
+
+-- Layer 1: Data
+PlayerDataManager:Init()
+
+-- Layer 2: Economy / Inventory
+EconomyManager:Init({
+    PlayerDataManager = PlayerDataManager,
+    NetworkManager = NetworkManager,
+})
+
+InventoryManager:Init({
+    PlayerDataManager = PlayerDataManager,
+    EconomyManager = EconomyManager,
+})
+
+-- Layer 3: Progression
+ProgressionManager:Init({
+    PlayerDataManager = PlayerDataManager,
+    EconomyManager = EconomyManager,
+    NetworkManager = NetworkManager,
+})
+
+-- Layer 4: Squad, Disaster
+SquadManager:Init({
+    NetworkManager = NetworkManager,
+})
+
 DisasterManager:Init()
 
--- Layer 1: Depends on NetworkManager
-SquadManager:Init({ NetworkManager = NetworkManager })
-
--- Layer 2: Depends on NetworkManager + DisasterManager
+-- Layer 5: Rescue (active gameplay)
 RescueManager:Init({
     NetworkManager = NetworkManager,
     DisasterManager = DisasterManager,
 })
 
--- Layer 3: Depends on DataManager + NetworkManager
-EconomyManager:Init({
-    PlayerDataManager = DataManager,
-    NetworkManager = NetworkManager,
-})
-
-ProgressionManager:Init({
-    PlayerDataManager = DataManager,
-    EconomyManager = EconomyManager,
-    NetworkManager = NetworkManager,
-})
-
--- Layer 4: Top-level orchestrator
+-- Layer 6: Game orchestrator
 GameManager:Init({
     SquadManager = SquadManager,
     DisasterManager = DisasterManager,
@@ -60,57 +81,130 @@ GameManager:Init({
 })
 
 ----------------------------------------------------------------------
--- Register client-to-server event handlers
+-- WIRE UP CLIENT -> SERVER EVENT HANDLERS
 ----------------------------------------------------------------------
 
-NetworkManager:OnClientEvent("PlayerReady", function(player, data)
-    SquadManager:SetPlayerReady(player, true)
+-- Player ready toggle
+NetworkManager:OnClientEvent("PlayerReady", function(player, isReady)
+    if type(isReady) ~= "boolean" then
+        -- Support legacy payload format { ready = true }
+        if type(isReady) == "table" then
+            isReady = true
+        else
+            return
+        end
+    end
+    SquadManager:SetPlayerReady(player, isReady)
 end)
 
+-- Role selection
 NetworkManager:OnClientEvent("RoleSelected", function(player, data)
-    if data and data.role then
-        SquadManager:SetPreferredRole(player, data.role)
+    local roleName = data
+    if type(data) == "table" and data.role then
+        roleName = data.role
     end
+    local valid = NetworkManager.ValidateEnum(roleName, {
+        "Medic", "Engineer", "K9Handler", "Pilot", "Diver", "Commander",
+    })
+    if not valid then return end
+    SquadManager:SetPreferredRole(player, valid)
 end)
 
-NetworkManager:OnClientEvent("InteractionRequest", function(player, data)
-    if data and data.actionType and data.targetId then
-        RescueManager:HandleInteraction(player, data.actionType, data.targetId)
-    end
+-- Ability activation
+NetworkManager:OnClientEvent("AbilityActivated", function(player, abilityId)
+    if type(abilityId) ~= "string" then return end
+    -- Route to RescueManager; abilities map to specialized interactions
+    RescueManager:HandleInteraction(player, abilityId, "")
 end)
 
+-- Interaction requests (rescue, repair, heal, neutralize)
+NetworkManager:OnClientEvent("InteractionRequest", function(player, actionTypeOrData, targetId)
+    -- Support both (player, actionType, targetId) and (player, {actionType, targetId}) formats
+    local actionType, target
+    if type(actionTypeOrData) == "table" then
+        actionType = actionTypeOrData.actionType
+        target = actionTypeOrData.targetId
+    else
+        actionType = actionTypeOrData
+        target = targetId
+    end
+
+    local validAction = NetworkManager.ValidateString(actionType, 50)
+    local validTarget = NetworkManager.ValidateString(target, 100)
+    if not validAction or not validTarget then return end
+    RescueManager:HandleInteraction(player, validAction, validTarget)
+end)
+
+-- Squad invites
 NetworkManager:OnClientEvent("SquadInviteSent", function(player, data)
-    if data and data.targetPlayerId then
-        local squad = SquadManager:GetPlayerSquad(player)
-        if squad then
-            local targetPlayer = game:GetService("Players"):GetPlayerByUserId(data.targetPlayerId)
-            if targetPlayer then
-                SquadManager:InviteToSquad(squad.squadId, targetPlayer)
+    local targetPlayerId
+    if type(data) == "table" and data.targetPlayerId then
+        targetPlayerId = data.targetPlayerId
+    elseif type(data) == "number" then
+        targetPlayerId = data
+    else
+        return
+    end
+
+    local targetId = NetworkManager.ValidateNumber(targetPlayerId, 1, 2^53)
+    if not targetId then return end
+    local targetPlayer = game:GetService("Players"):GetPlayerByUserId(targetId)
+    if not targetPlayer then return end
+    local squad = SquadManager:GetPlayerSquad(player)
+    if not squad then return end
+    SquadManager:InviteToSquad(squad.squadId, targetPlayer)
+end)
+
+-- Squad invite response
+NetworkManager:OnClientEvent("SquadInviteResponse", function(player, squadId, accepted)
+    if type(squadId) ~= "string" or type(accepted) ~= "boolean" then return end
+    if accepted then
+        SquadManager:InviteToSquad(squadId, player)
+    end
+end)
+
+-- Equipment changes
+NetworkManager:OnClientEvent("EquipmentChanged", function(player, itemId, equipped)
+    if type(itemId) ~= "string" or type(equipped) ~= "boolean" then return end
+    InventoryManager:SetEquipped(player, itemId, equipped)
+end)
+
+-- Purchase requests
+NetworkManager:OnClientEvent("PurchaseRequest", function(player, data)
+    local itemId = data
+    if type(data) == "table" and data.itemId then
+        itemId = data.itemId
+    end
+    if type(itemId) ~= "string" then return end
+
+    local success, err = EconomyManager:PurchaseItem(player, itemId)
+    NetworkManager:FireClient(player, "NotificationPush", {
+        title = success and "Purchase Complete!" or "Purchase Failed",
+        message = success and `You bought {itemId}!` or (err or "Unknown error"),
+        type = success and "Success" or "Error",
+    })
+end)
+
+-- Settings changes
+NetworkManager:OnClientEvent("SettingsChanged", function(player, settings)
+    if type(settings) ~= "table" then return end
+    PlayerDataManager:UpdateData(player, function(d)
+        for key, value in settings do
+            if d.settings[key] ~= nil and type(value) == type(d.settings[key]) then
+                d.settings[key] = value
             end
         end
-    end
-end)
-
-NetworkManager:OnClientEvent("PurchaseRequest", function(player, data)
-    if data and data.itemId then
-        local success, err = EconomyManager:PurchaseItem(player, data.itemId)
-        if not success then
-            NetworkManager:FireClient(player, "NotificationPush", {
-                type = "Error",
-                message = err or "Purchase failed",
-            })
-        end
-    end
+        return d
+    end)
 end)
 
 ----------------------------------------------------------------------
--- Register RemoteFunction handlers
+-- WIRE UP REMOTE FUNCTIONS (Client queries)
 ----------------------------------------------------------------------
 
 NetworkManager:OnClientInvoke("GetPlayerData", function(player)
-    local data = DataManager:GetData(player)
+    local data = PlayerDataManager:GetData(player)
     if not data then return nil end
-    -- Return a sanitized copy (exclude internal fields)
     return {
         globalLevel = data.globalLevel,
         globalXP = data.globalXP,
@@ -129,32 +223,37 @@ NetworkManager:OnClientInvoke("GetPlayerData", function(player)
     }
 end)
 
-NetworkManager:OnClientInvoke("GetShopCatalog", function(player)
+NetworkManager:OnClientInvoke("GetShopCatalog", function(_player)
     return EconomyManager:GetShopCatalog()
 end)
 
 NetworkManager:OnClientInvoke("GetSquadInfo", function(player)
     local squad = SquadManager:GetPlayerSquad(player)
-    if squad then
-        return {
-            squadId = squad.squadId,
-            members = squad.members,
-            leaderId = squad.leaderId,
-        }
-    end
-    return nil
+    if not squad then return nil end
+    return {
+        squadId = squad.squadId,
+        members = squad.members,
+        leaderId = squad.leaderId,
+    }
 end)
 
 ----------------------------------------------------------------------
--- Auto-enqueue players when they join (for quick matchmaking demo)
+-- POST-BOOT: Handle player lifecycle
 ----------------------------------------------------------------------
 game:GetService("Players").PlayerAdded:Connect(function(player)
-    -- Give DataManager time to load
-    task.wait(2)
-    -- Auto-claim daily reward
-    ProgressionManager:AwardDailyLogin(player)
-    -- Auto-enqueue for matchmaking
-    SquadManager:EnqueuePlayer(player)
+    -- Wait for data to load, then process daily login and game passes
+    PlayerDataManager.DataLoaded:Connect(function(p, _data)
+        if p == player then
+            ProgressionManager:AwardDailyLogin(player)
+            EconomyManager:LoadGamePasses(player)
+            -- Auto-enqueue for matchmaking after brief delay
+            task.delay(2, function()
+                if player.Parent then
+                    SquadManager:EnqueuePlayer(player)
+                end
+            end)
+        end
+    end)
 end)
 
-print("=== Rescue Squad Simulator Server Ready ===")
+print("=== Rescue Squad Simulator: Server Ready ===")
